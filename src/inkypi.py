@@ -33,6 +33,7 @@ from blueprints.apikeys import apikeys_bp
 from jinja2 import ChoiceLoader, FileSystemLoader
 from plugins.plugin_registry import load_plugins
 from waitress import serve
+from utils.systemd_notify import notify as sd_notify, start_watchdog
 
 
 logger = logging.getLogger(__name__)
@@ -89,11 +90,19 @@ if __name__ == '__main__':
     # start the background refresh task
     refresh_task.start()
 
+    # tell systemd we are up (Type=notify) and start the watchdog heartbeat
+    sd_notify("READY=1")
+    start_watchdog(refresh_task.is_healthy)
+
     # display default inkypi image on startup
     if device_config.get_config("startup") is True:
         logger.info("Startup flag is set, displaying startup image")
-        img = generate_startup_image(device_config.get_resolution())
-        display_manager.display_image(img)
+        try:
+            img = generate_startup_image(device_config.get_resolution())
+            display_manager.display_image(img)
+        except Exception:
+            # never let a display problem keep the web UI from starting
+            logger.exception("Failed to display startup image")
         device_config.update_value("startup", False, write=True)
 
     try:
@@ -112,6 +121,7 @@ if __name__ == '__main__':
             except:
                 pass  # Ignore if we can't get the IP
 
-        serve(app, host="0.0.0.0", port=PORT, threads=1)
+        # Several threads so the UI stays responsive while one request waits for a display update.
+        serve(app, host="0.0.0.0", port=PORT, threads=4, channel_timeout=60)
     finally:
         refresh_task.stop()
