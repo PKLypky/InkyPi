@@ -12,6 +12,9 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+# A single refresh (render + e-paper update) taking longer than this is treated as hung.
+DEFAULT_MAX_REFRESH_SECONDS = 600
+
 class RefreshTask:
     """Handles the logic for refreshing the display using a background thread."""
 
@@ -25,9 +28,15 @@ class RefreshTask:
         self.running = False
         self.manual_update_request = ()
 
+        self.manual_pending = False
+
         self.refresh_event = threading.Event()
         self.refresh_event.set()
         self.refresh_result = {}
+
+        # monotonic time when the current refresh started, None while idle
+        self.refresh_started_at = None
+        self.last_cycle_at = time.monotonic()
 
     def start(self):
         """Starts the background thread for refreshing the display."""
@@ -44,7 +53,7 @@ class RefreshTask:
             self.condition.notify_all()  # Wake the thread to let it exit
         if self.thread:
             logger.info("Stopping refresh task")
-            self.thread.join()
+            self.thread.join(timeout=15)
 
     def _run(self):
         """Background task that manages the periodic refresh of the display.
@@ -71,79 +80,123 @@ class RefreshTask:
         - Captures and logs any unexpected errors during execution to prevent the thread from exiting.
         """
         while True:
+            refresh_action = None
             try:
+                # Only hold the lock while reading/updating shared state. Generating the image
+                # (Chromium) and drawing it on the panel can take minutes on a Pi Zero 2, and
+                # holding the lock for that long blocked every web request that touched it.
                 with self.condition:
                     sleep_time = self.device_config.get_config("plugin_cycle_interval_seconds", default=60*60)
 
-                    # Wait for sleep_time or until notified
-                    self.condition.wait(timeout=sleep_time)
-                    self.refresh_result = {}
-                    self.refresh_event.clear()
+                    # Wait for sleep_time or until notified, unless a manual request is already queued
+                    if not self.manual_update_request and self.running:
+                        self.condition.wait(timeout=sleep_time)
 
                     # Exit if `stop()` is called
                     if not self.running:
                         break
 
-                    playlist_manager = self.device_config.get_playlist_manager()
-                    latest_refresh = self.device_config.get_refresh_info()
-                    current_dt = self._get_current_datetime()
-
-                    refresh_action = None
                     if self.manual_update_request:
-                        # handle immediate update request
                         logger.info("Manual update requested")
                         refresh_action = self.manual_update_request
                         self.manual_update_request = ()
-                    else:
+                        self.manual_pending = False
+                        self.refresh_result = {}
+                        self.refresh_event.clear()
 
-                        if self.device_config.get_config("log_system_stats"):
-                            self.log_system_stats()
+                    self.refresh_started_at = time.monotonic()
 
-                        # handle refresh based on playlists
-                        logger.info(f"Running interval refresh check. | current_time: {current_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                        playlist, plugin_instance = self._determine_next_plugin(playlist_manager, latest_refresh, current_dt)
-                        if plugin_instance:
-                            refresh_action = PlaylistRefresh(playlist, plugin_instance)
-
-                    if refresh_action:
-                        plugin_config = self.device_config.get_plugin(refresh_action.get_plugin_id())
-                        if plugin_config is None:
-                            logger.error(f"Plugin config not found for '{refresh_action.get_plugin_id()}'.")
-                            continue
-                        plugin = get_plugin_instance(plugin_config)
-                        image = refresh_action.execute(plugin, self.device_config, current_dt)
-                        image_hash = compute_image_hash(image)
-
-                        refresh_info = refresh_action.get_refresh_info()
-                        refresh_info.update({"refresh_time": current_dt.isoformat(), "image_hash": image_hash})
-                        # check if image is the same as current image
-                        if image_hash != latest_refresh.image_hash:
-                            logger.info(f"Updating display. | refresh_info: {refresh_info}")
-                            self.display_manager.display_image(image, image_settings=plugin.config.get("image_settings", []))
-                        else:
-                            logger.info(f"Image already displayed, skipping refresh. | refresh_info: {refresh_info}")
-
-                        # update latest refresh data in the device config
-                        self.device_config.refresh_info = RefreshInfo(**refresh_info)
-                        self.device_config.write_config()
+                self._do_refresh(refresh_action)
 
             except Exception as e:
                 logger.exception('Exception during refresh')
                 self.refresh_result["exception"] = e  # Capture exception
             finally:
-                self.refresh_event.set()
+                self.refresh_started_at = None
+                self.last_cycle_at = time.monotonic()
+                with self.condition:
+                    # a manual request queued while this cycle ran is handled next; keep its waiter waiting
+                    if not self.manual_pending:
+                        self.refresh_event.set()
+
+    def _do_refresh(self, refresh_action):
+        """Runs one refresh cycle outside of the lock. `refresh_action` is set for manual updates."""
+        playlist_manager = self.device_config.get_playlist_manager()
+        latest_refresh = self.device_config.get_refresh_info()
+        current_dt = self._get_current_datetime()
+
+        if not refresh_action:
+            if self.device_config.get_config("log_system_stats"):
+                self.log_system_stats()
+
+            # handle refresh based on playlists
+            logger.info(f"Running interval refresh check. | current_time: {current_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            playlist, plugin_instance = self._determine_next_plugin(playlist_manager, latest_refresh, current_dt)
+            if plugin_instance:
+                refresh_action = PlaylistRefresh(playlist, plugin_instance)
+
+        if not refresh_action:
+            return
+
+        plugin_config = self.device_config.get_plugin(refresh_action.get_plugin_id())
+        if plugin_config is None:
+            logger.error(f"Plugin config not found for '{refresh_action.get_plugin_id()}'.")
+            return
+        plugin = get_plugin_instance(plugin_config)
+        started = time.monotonic()
+        image = refresh_action.execute(plugin, self.device_config, current_dt)
+        if image is None:
+            raise RuntimeError(f"Plugin '{refresh_action.get_plugin_id()}' did not return an image")
+        logger.info(f"Image generated in {time.monotonic() - started:.1f}s")
+        image_hash = compute_image_hash(image)
+
+        refresh_info = refresh_action.get_refresh_info()
+        refresh_info.update({"refresh_time": current_dt.isoformat(), "image_hash": image_hash})
+        # check if image is the same as current image
+        if image_hash != latest_refresh.image_hash:
+            logger.info(f"Updating display. | refresh_info: {refresh_info}")
+            started = time.monotonic()
+            self.display_manager.display_image(image, image_settings=plugin.config.get("image_settings", []))
+            logger.info(f"Display updated in {time.monotonic() - started:.1f}s")
+        else:
+            logger.info(f"Image already displayed, skipping refresh. | refresh_info: {refresh_info}")
+
+        # update latest refresh data in the device config
+        self.device_config.refresh_info = RefreshInfo(**refresh_info)
+        self.device_config.write_config()
+
+    def is_healthy(self):
+        """True unless the refresh thread died or one refresh has been running for too long.
+
+        Used by the systemd watchdog: when this returns False we stop sending heartbeats and
+        systemd restarts the service, which recovers from a hung Chromium or e-paper driver.
+        """
+        if not self.thread or not self.thread.is_alive():
+            return False
+        started = self.refresh_started_at
+        if started is None:
+            return True
+        max_seconds = self.device_config.get_config("max_refresh_seconds", default=DEFAULT_MAX_REFRESH_SECONDS)
+        return (time.monotonic() - started) < max_seconds
 
     def manual_update(self, refresh_action):
-        """Manually triggers an update for the specified plugin id and plugin settings by notifying the background process."""
+        """Manually triggers an update for the specified plugin id and plugin settings by notifying the background process.
+
+        Waits for the refresh to finish, but no longer than `max_refresh_seconds`, so a hung
+        plugin or display can never block a web request forever.
+        """
         if self.running:
             with self.condition:
                 self.manual_update_request = refresh_action
+                self.manual_pending = True
                 self.refresh_result = {}
                 self.refresh_event.clear()
 
                 self.condition.notify_all()  # Wake the thread to process manual update
 
-            self.refresh_event.wait()
+            timeout = self.device_config.get_config("max_refresh_seconds", default=DEFAULT_MAX_REFRESH_SECONDS)
+            if not self.refresh_event.wait(timeout=timeout):
+                raise TimeoutError(f"Display update did not finish within {timeout} seconds")
             if self.refresh_result.get("exception"):
                 raise self.refresh_result.get("exception")
         else:

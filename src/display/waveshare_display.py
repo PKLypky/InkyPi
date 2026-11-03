@@ -2,6 +2,7 @@ import inspect
 import importlib
 import logging
 import sys
+import time
 
 from display.abstract_display import AbstractDisplay
 from PIL import Image
@@ -9,6 +10,32 @@ from pathlib import Path
 from plugins.plugin_registry import get_plugin_instance
 
 logger = logging.getLogger(__name__)
+
+# ACeP 7-color panels need ~30-35s per full refresh; anything far beyond that means the BUSY
+# line is stuck and the vendor driver would spin in its busy-wait loop forever.
+DEFAULT_DISPLAY_TIMEOUT_SECONDS = 180
+
+
+class DisplayTimeoutError(TimeoutError):
+    pass
+
+
+def _install_busy_timeout(epdconfig_module, display):
+    """Wrap epdconfig.delay_ms so vendor busy-wait loops honour a deadline.
+
+    Every Waveshare driver waits for the BUSY pin with `while busy: epdconfig.delay_ms(...)`.
+    The loops have no timeout, so a flaky BUSY line hangs the refresh thread forever. While a
+    deadline is armed, delay_ms raises DisplayTimeoutError once it passes.
+    """
+    original_delay = epdconfig_module.delay_ms
+
+    def delay_ms(delaytime):
+        deadline = display._busy_deadline
+        if deadline is not None and time.monotonic() > deadline:
+            raise DisplayTimeoutError("E-paper display did not become ready in time (BUSY pin stuck?)")
+        original_delay(delaytime)
+
+    epdconfig_module.delay_ms = delay_ms
 
 
 def split_image_for_bi_color_epd(image):
@@ -73,6 +100,12 @@ class WaveshareDisplay(AbstractDisplay):
         try:
             # Dynamically load module
             epd_module = importlib.import_module(module_name)  
+            self._busy_deadline = None
+            self._epdconfig = getattr(epd_module, "epdconfig", None)
+            if self._epdconfig is not None and hasattr(self._epdconfig, "delay_ms"):
+                _install_busy_timeout(self._epdconfig, self)
+            else:
+                logger.warning("Could not find epdconfig in driver module, busy-wait timeout disabled")
             self.epd_display = epd_module.EPD()
             # Workaround for init functions with inconsistent casing
             self.epd_display_init = getattr(self.epd_display, "Init", getattr(self.epd_display, "init", None))
@@ -120,23 +153,43 @@ class WaveshareDisplay(AbstractDisplay):
         if not image:
             raise ValueError(f"No image provided.")
 
-        # Assume device was in sleep mode.
-        self.epd_display_init()
+        timeout = self.device_config.get_config("display_timeout_seconds", default=DEFAULT_DISPLAY_TIMEOUT_SECONDS)
+        self._busy_deadline = time.monotonic() + timeout
+        try:
+            # Assume device was in sleep mode.
+            self.epd_display_init()
 
-        # Clear residual pixels before updating the image.
-        self.epd_display.Clear()
+            # Clearing first doubles the refresh time on 7-color panels and is normally not
+            # needed, since a full refresh already redraws every pixel. Opt in via config.
+            if self.device_config.get_config("clear_before_refresh", default=False):
+                logger.info("Clearing display before update.")
+                self.epd_display.Clear()
 
-        # Display the image on the WS display.
-        if not self.bi_color_display:
-            self.epd_display.display(self.epd_display.getbuffer(image))
-        else:
-            black_layer, red_layer = split_image_for_bi_color_epd(image)
+            # Display the image on the WS display.
+            if not self.bi_color_display:
+                self.epd_display.display(self.epd_display.getbuffer(image))
+            else:
+                black_layer, red_layer = split_image_for_bi_color_epd(image)
 
-            self.epd_display.display(
-                self.epd_display.getbuffer(black_layer),
-                self.epd_display.getbuffer(red_layer),
-            )
+                self.epd_display.display(
+                    self.epd_display.getbuffer(black_layer),
+                    self.epd_display.getbuffer(red_layer),
+                )
 
-        # Put device into low power mode (EPD displays maintain image when powered off)
-        logger.info("Putting Waveshare display into sleep mode for power saving.")
-        self.epd_display.sleep()
+            # Put device into low power mode (EPD displays maintain image when powered off)
+            logger.info("Putting Waveshare display into sleep mode for power saving.")
+            self.epd_display.sleep()
+        except Exception:
+            # Power the panel down and release SPI so the next refresh starts from a clean state.
+            self._busy_deadline = None
+            self._power_off()
+            raise
+        finally:
+            self._busy_deadline = None
+
+    def _power_off(self):
+        try:
+            if self._epdconfig is not None and hasattr(self._epdconfig, "module_exit"):
+                self._epdconfig.module_exit()
+        except Exception:
+            logger.exception("Failed to power off the e-paper module")

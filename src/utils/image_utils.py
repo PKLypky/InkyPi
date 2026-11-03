@@ -7,8 +7,33 @@ import hashlib
 import tempfile
 import subprocess
 import shutil
+import signal
 
 logger = logging.getLogger(__name__)
+
+# Hard limit for one headless Chromium screenshot. On a Pi Zero 2 a cold start plus render
+# normally takes 20-60s; a process still running after this is considered hung and killed.
+SCREENSHOT_HARD_TIMEOUT_SECONDS = 150
+
+
+def _run_with_timeout(command, timeout_s):
+    """Run a command in its own process group and kill the whole group on timeout.
+
+    subprocess.run(timeout=...) only kills the direct child, leaving Chromium's helper
+    processes behind and holding memory on a 512MB device.
+    """
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        return proc.returncode, stdout, stderr
+    except subprocess.TimeoutExpired:
+        logger.error(f"Screenshot process exceeded {timeout_s}s, killing it")
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        return None, b"", b""
 
 def get_image(image_url):
     response = requests.get(image_url, timeout=30)
@@ -95,10 +120,11 @@ def take_screenshot_html(html_str, dimensions, timeout_ms=None):
             html_file.write(html_str.encode("utf-8"))
             html_file_path = html_file.name
 
-        image = take_screenshot(html_file_path, dimensions, timeout_ms)
-
-        # Remove html file
-        os.remove(html_file_path)
+        try:
+            image = take_screenshot(html_file_path, dimensions, timeout_ms)
+        finally:
+            # Remove html file even when the screenshot fails, so /tmp doesn't fill up
+            os.remove(html_file_path)
 
     except Exception as e:
         logger.error(f"Failed to take screenshot: {str(e)}")
@@ -152,19 +178,25 @@ def take_screenshot(target, dimensions, timeout_ms=None):
         ]
         if timeout_ms:
             command.append(f"--timeout={timeout_ms}")
-        result = subprocess.run(command, capture_output=True, check=False)
+        hard_timeout = SCREENSHOT_HARD_TIMEOUT_SECONDS
+        if timeout_ms:
+            hard_timeout = max(hard_timeout, timeout_ms / 1000 + 60)
+        try:
+            returncode, _, stderr = _run_with_timeout(command, hard_timeout)
 
-        # Check if the process failed or the output file is missing
-        if result.returncode != 0 or not os.path.exists(img_file_path):
-            logger.error(f"Failed to take screenshot (return code: {result.returncode})")
-            return None
+            # Check if the process failed or the output file is missing
+            if returncode != 0 or not os.path.exists(img_file_path) or os.path.getsize(img_file_path) == 0:
+                tail = stderr.decode(errors="replace").strip().splitlines()[-3:] if stderr else []
+                logger.error(f"Failed to take screenshot (return code: {returncode}) {' | '.join(tail)}")
+                return None
 
-        # Load the image using PIL
-        with Image.open(img_file_path) as img:
-            image = img.copy()
-
-        # Remove image files
-        os.remove(img_file_path)
+            # Load the image using PIL
+            with Image.open(img_file_path) as img:
+                image = img.copy()
+        finally:
+            # Remove image files even on failure
+            if os.path.exists(img_file_path):
+                os.remove(img_file_path)
 
     except Exception as e:
         logger.error(f"Failed to take screenshot: {str(e)}")

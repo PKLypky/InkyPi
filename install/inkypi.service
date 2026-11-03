@@ -2,19 +2,33 @@
 Description=InkyPi App
 After=network-online.target
 Wants=network-online.target
+# give up restarting only if it crashes 10 times within 30 minutes
+StartLimitIntervalSec=1800
+StartLimitBurst=10
 
 [Service]
 User=root
 RuntimeDirectory=inkypi
 WorkingDirectory=/run/inkypi
 ExecStart=/usr/local/bin/inkypi run
-Restart=on-failure
-RestartSec=60
+# The app reports READY=1 and sends watchdog heartbeats while the refresh thread is healthy.
+# If a refresh hangs (Chromium or the e-paper driver) systemd restarts the service.
+Type=notify
+NotifyAccess=main
+WatchdogSec=180
+TimeoutStartSec=300
+TimeoutStopSec=30
+Restart=always
+RestartSec=20
 KillSignal=SIGINT
+KillMode=mixed
 StandardOutput=journal
 StandardError=journal
-CPUQuota=40%
-MemoryMax=200M
+# Chromium runs inside this cgroup. A hard MemoryMax of 200M OOM-killed it mid-render on a
+# 512MB Pi Zero 2, and CPUQuota=40% (0.4 of one core) made renders take minutes.
+# MemoryHigh only applies reclaim pressure; earlyoom protects the system as a whole.
+MemoryHigh=320M
+Nice=5
 
 [Install]
 WantedBy=multi-user.target

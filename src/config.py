@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import threading
 from dotenv import load_dotenv
 from model import PlaylistManager, RefreshInfo
 
@@ -20,6 +21,8 @@ class Config:
     plugin_image_dir = os.path.join(BASE_DIR, "static", "images", "plugins")
 
     def __init__(self):
+        # config is written from web request threads and the refresh thread
+        self._write_lock = threading.RLock()
         self.config = self.read_config()
         self.plugins_list = self.read_plugins_list()
         self.playlist_manager = self.load_playlist_manager()
@@ -55,10 +58,17 @@ class Config:
     def write_config(self):
         """Updates the cached config from the model objects and writes to the config file."""
         logger.debug(f"Writing device config to {self.config_file}")
-        self.update_value("playlist_config", self.playlist_manager.to_dict())
-        self.update_value("refresh_info", self.refresh_info.to_dict())
-        with open(self.config_file, 'w') as outfile:
-            json.dump(self.config, outfile, indent=4)
+        with self._write_lock:
+            self.update_value("playlist_config", self.playlist_manager.to_dict())
+            self.update_value("refresh_info", self.refresh_info.to_dict())
+            # Write to a temp file and atomically replace, so a power cut or crash mid-write
+            # can never leave a truncated device.json that stops the service from starting.
+            tmp_file = f"{self.config_file}.tmp"
+            with open(tmp_file, 'w') as outfile:
+                json.dump(self.config, outfile, indent=4)
+                outfile.flush()
+                os.fsync(outfile.fileno())
+            os.replace(tmp_file, self.config_file)
 
     def get_config(self, key=None, default={}):
         """Gets the value of a specific configuration key or returns the entire config if none provided."""
